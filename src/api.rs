@@ -232,6 +232,10 @@ impl ImageBuild {
 /// Group raw `/images` objects (one per id and region) into one `ImageBuild` per
 /// (family, arch), keeping the newest version and the sorted, de-duplicated region
 /// set. Consumes `images` to avoid copies. Ordered by (family, arch).
+///
+/// Images with no family are excluded: they can't be launched via
+/// `--image-family` / a family `image` param, so surfacing them here would present
+/// an unlaunchable value. `lambda images --all` still lists them (launchable by id).
 pub fn group_image_builds(images: Vec<Image>) -> Vec<ImageBuild> {
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -243,7 +247,10 @@ pub fn group_image_builds(images: Vec<Image>) -> Vec<ImageBuild> {
 
     let mut builds: BTreeMap<(String, String), Acc> = BTreeMap::new();
     for img in images {
-        let family = img.family.unwrap_or_else(|| "-".to_string());
+        // Family-less images aren't launchable by family; leave them to `--all`.
+        let Some(family) = img.family.filter(|f| !f.is_empty()) else {
+            continue;
+        };
         let arch = img.architecture.unwrap_or_else(|| "-".to_string());
         // Treat a null OR empty version as the "-" placeholder so the is_empty()
         // sentinel below only ever fires on the accumulator's initial state.
@@ -989,8 +996,9 @@ mod tests {
             img("e", None, "1.0", "x86_64", "eu-west-1"),
         ];
         let builds = group_image_builds(images);
-        // (ls-24, x86_64), (ls-24, arm64), ("-", x86_64) => three builds.
-        assert_eq!(builds.len(), 3);
+        // (ls-24, x86_64) and (ls-24, arm64) => two builds; the family-less image
+        // is excluded (not launchable via a family).
+        assert_eq!(builds.len(), 2);
 
         let x86 = builds
             .iter()
@@ -1001,7 +1009,7 @@ mod tests {
         assert_eq!(x86.regions, vec!["us-east-1", "us-west-1"]);
         assert_eq!(x86.regions_summary(), "us-east-1, us-west-1");
 
-        // Null-family image is bucketed under "-", not merged into ls-24.
-        assert!(builds.iter().any(|b| b.family == "-"));
+        // A family-less image is never presented as a launchable "-" family.
+        assert!(builds.iter().all(|b| b.family != "-"));
     }
 }

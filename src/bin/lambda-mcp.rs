@@ -156,11 +156,9 @@ impl LambdaService {
     /// Drill-down view: every image id/region for one family (the `--all` equivalent,
     /// scoped so it stays small). Use an id here to launch an exact build.
     fn format_images_in_family(images: &[Image], family: &str) -> String {
-        // Match null families under "-", consistent with how group_image_builds
-        // buckets them, so a "-" row shown in the grouped view is drillable.
         let mut matches: Vec<&Image> = images
             .iter()
-            .filter(|i| i.family.as_deref().unwrap_or("-") == family)
+            .filter(|i| i.family.as_deref() == Some(family))
             .collect();
         if matches.is_empty() {
             return format!(
@@ -274,7 +272,15 @@ impl LambdaService {
         &self,
         Parameters(params): Parameters<StartInstanceParams>,
     ) -> Result<CallToolResult, McpError> {
-        let image = params.image.as_deref().map(ImageRef::smart);
+        // Trim and treat empty/whitespace as absent — agents often send "" or a
+        // value with stray spaces for an optional field; those would otherwise be
+        // classified as a (bogus) family and fail validation.
+        let image = params
+            .image
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(ImageRef::smart);
 
         let result = self
             .client
