@@ -90,6 +90,7 @@ export LAMBDA_NOTIFY_TELEGRAM_CHAT_ID="123456789"
 | `lambda start` | Launch a new instance |
 | `lambda stop` | Terminate an instance |
 | `lambda find` | Poll until a GPU type is available, then launch |
+| `lambda images` | Show available base images grouped by family (add `--all` for every id/region) |
 
 ### Examples
 
@@ -113,6 +114,22 @@ lambda stop --instance-id <id>
 lambda find --gpu gpu_8x_h100 --ssh my-key --interval 30
 ```
 
+**Choose a base image** (defaults to Lambda Stack if omitted):
+```bash
+# List available images to find valid families and IDs
+lambda images
+
+# --image accepts either a family or an image ID (auto-detected).
+# Family is recommended: it's region-agnostic and always resolves.
+lambda start --gpu gpu_1x_a10 --ssh my-key --image lambda-stack-24-04
+lambda start --gpu gpu_1x_a10 --ssh my-key --image <image-id>
+
+# Use --image-family / --image-id to force a specific kind (e.g. in scripts)
+lambda start --gpu gpu_1x_a10 --ssh my-key --image-family lambda-stack-24-04
+```
+
+> A given image ID exists only in certain regions, so pinning `--image-id`/`--image` with an ID ties the launch to those regions (the CLI picks one with GPU capacity, or waits for it under `find`). A **family** lets Lambda resolve the right image for whichever region you land in — prefer it unless you need an exact, reproducible build.
+
 ### CLI Options
 
 #### start
@@ -123,7 +140,12 @@ lambda find --gpu gpu_8x_h100 --ssh my-key --interval 30
 | `-n, --name` | Instance name |
 | `-r, --region` | Region (auto-selects if omitted) |
 | `-f, --filesystem` | Filesystem to attach (must be in same region) |
+| `--image` | Base image — an image ID or a family, auto-detected (see `lambda images`) |
+| `--image-id` | Force an exact image ID |
+| `--image-family` | Force an image family (newest in the family) |
 | `--no-notify` | Disable notifications even if env vars are set |
+
+`--image`, `--image-id`, and `--image-family` are mutually exclusive.
 
 #### find
 | Flag | Description |
@@ -133,6 +155,9 @@ lambda find --gpu gpu_8x_h100 --ssh my-key --interval 30
 | `--interval` | Poll interval in seconds (default: 10) |
 | `-n, --name` | Instance name when launched |
 | `-f, --filesystem` | Filesystem to attach when launched |
+| `--image` | Base image — an image ID or a family, auto-detected (see `lambda images`) |
+| `--image-id` | Force an exact image ID |
+| `--image-family` | Force an image family (newest in the family) |
 | `--no-notify` | Disable notifications even if env vars are set |
 
 Notifications are **automatic** when env vars are configured. Use `--no-notify` to disable:
@@ -177,10 +202,11 @@ npx @strand-ai/lambda-mcp --eager
 | Tool | Description |
 |------|-------------|
 | `list_gpu_types` | List all available GPU instance types with pricing, specs, and current availability |
-| `start_instance` | Launch a new GPU instance (auto-notifies if configured) |
+| `start_instance` | Launch a new GPU instance (auto-notifies if configured); optional `image` (an image id or a family, auto-detected) to pick a base image |
 | `stop_instance` | Terminate a running instance |
 | `list_running_instances` | Show all running instances with status and connection details |
 | `check_availability` | Check if a specific GPU type is available |
+| `list_images` | List base images grouped by family; pass a `family` arg to drill into its per-region ids. Launch via `start_instance`'s `image` param |
 
 ### Auto-Notifications
 

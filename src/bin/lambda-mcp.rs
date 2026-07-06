@@ -1,5 +1,8 @@
 use anyhow::Result;
-use lambda_cli::api::{Filesystem, Instance, InstanceTypeData, LambdaClient};
+use lambda_cli::api::{
+    group_image_builds, version_key, Filesystem, Image, ImageRef, Instance, InstanceTypeData,
+    LambdaClient,
+};
 use lambda_cli::notify::{InstanceReadyMessage, Notifier, NotifyConfig};
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -122,6 +125,77 @@ impl LambdaService {
         }
         output
     }
+
+    /// Grouped image view (default): one line per family+arch with the newest build
+    /// and where it's offered. Mirrors `lambda images` so CLI and MCP granularity
+    /// match. `family` is the value to pass to start_instance (region-agnostic).
+    fn format_image_builds(images: Vec<Image>) -> String {
+        let builds = group_image_builds(images);
+        if builds.is_empty() {
+            return "No images.".to_string();
+        }
+        let mut output = String::from(
+            "Available base images, grouped by family (launch start_instance with a family — \
+             region-agnostic, gets the newest build). Pass `family` to this tool to list the \
+             individual per-region image ids for a specific build.\n\n",
+        );
+        for b in builds {
+            // `regions_summary` collapses long region lists to a count (shared with
+            // the CLI grouped view) so the response stays compact.
+            output.push_str(&format!(
+                "• family: {} | latest: {} | arch: {} | regions: {}\n",
+                b.family,
+                b.latest_version,
+                b.arch,
+                b.regions_summary()
+            ));
+        }
+        output
+    }
+
+    /// Drill-down view: every image id/region for one family (the `--all` equivalent,
+    /// scoped so it stays small). Use an id here to launch an exact build.
+    fn format_images_in_family(images: &[Image], family: &str) -> String {
+        // Match null families under "-", consistent with how group_image_builds
+        // buckets them, so a "-" row shown in the grouped view is drillable.
+        let mut matches: Vec<&Image> = images
+            .iter()
+            .filter(|i| i.family.as_deref().unwrap_or("-") == family)
+            .collect();
+        if matches.is_empty() {
+            return format!(
+                "No images in family '{}'. Call list_images with no family to see available families.",
+                family
+            );
+        }
+        // Newest version first, then by region name; key computed once per image.
+        matches.sort_by_cached_key(|i| {
+            (
+                std::cmp::Reverse(version_key(i.version.as_deref().unwrap_or(""))),
+                i.region.as_ref().and_then(|r| r.name.clone()),
+            )
+        });
+        let mut output = format!(
+            "Images in family '{}' (launch start_instance with one of these ids for an exact build):\n\n",
+            family
+        );
+        for img in matches {
+            let region = img
+                .region
+                .as_ref()
+                .and_then(|r| r.name.as_deref())
+                .unwrap_or("-");
+            output.push_str(&format!(
+                "• id: {} | name: {} | version: {} | arch: {} | region: {}\n",
+                img.id,
+                img.name.as_deref().unwrap_or("-"),
+                img.version.as_deref().unwrap_or("-"),
+                img.architecture.as_deref().unwrap_or("-"),
+                region
+            ));
+        }
+        output
+    }
 }
 
 // Tool parameter types
@@ -135,6 +209,10 @@ struct StartInstanceParams {
     name: Option<String>,
     /// Optional region to launch in (auto-selects if not specified)
     region: Option<String>,
+    /// Optional base image to launch on: either an image id or a family name
+    /// (auto-detected). Use the list_images tool to discover valid values.
+    /// Defaults to Lambda Stack if omitted.
+    image: Option<String>,
     /// Optional filesystem name to attach (must be in the same region)
     filesystem: Option<String>,
 }
@@ -165,6 +243,13 @@ struct DeleteFilesystemParams {
     filesystem_id: String,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ListImagesParams {
+    /// Optional family name to drill into: lists the individual per-region image
+    /// ids for that family. Omit for the grouped, one-per-family overview.
+    family: Option<String>,
+}
+
 #[tool_router]
 impl LambdaService {
     #[tool(
@@ -183,12 +268,14 @@ impl LambdaService {
     }
 
     #[tool(
-        description = "Launch a new GPU instance. Returns instance ID and connection details. Optionally attach a filesystem (must be in the same region). If notification env vars are configured, will auto-notify when instance is SSH-able."
+        description = "Launch a new GPU instance. Returns instance ID and connection details. Optionally attach a filesystem (must be in the same region) or select a base image via the image param, which accepts either an image id or a family name (defaults to Lambda Stack; use list_images to discover valid values). If notification env vars are configured, will auto-notify when instance is SSH-able."
     )]
     async fn start_instance(
         &self,
         Parameters(params): Parameters<StartInstanceParams>,
     ) -> Result<CallToolResult, McpError> {
+        let image = params.image.as_deref().map(ImageRef::smart);
+
         let result = self
             .client
             .launch_instance_with_filesystem(
@@ -196,6 +283,7 @@ impl LambdaService {
                 &params.ssh_key,
                 params.name.as_deref(),
                 params.region.as_deref(),
+                image,
                 params.filesystem.as_deref(),
             )
             .await
@@ -313,6 +401,34 @@ impl LambdaService {
         Ok(CallToolResult::success(vec![Content::text(
             Self::format_filesystems(&filesystems),
         )]))
+    }
+
+    #[tool(
+        description = "List available base images, grouped by family (one entry per family with its newest build and regions). Launch by passing a family to start_instance's image param (recommended, region-agnostic). Pass a `family` to this tool to drill into that family's individual per-region image ids for launching an exact build."
+    )]
+    async fn list_images(
+        &self,
+        Parameters(params): Parameters<ListImagesParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let images = self
+            .client
+            .list_images()
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        // Treat an empty/whitespace family as absent — agents commonly fill an
+        // optional string field with "" and expect the default (grouped) view.
+        let family = params
+            .family
+            .as_deref()
+            .map(str::trim)
+            .filter(|f| !f.is_empty());
+        let text = match family {
+            Some(family) => Self::format_images_in_family(&images, family),
+            None => Self::format_image_builds(images),
+        };
+
+        Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
     #[tool(

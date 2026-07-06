@@ -51,10 +51,11 @@ Then restart Claude Code.
 | Tool | Description |
 |------|-------------|
 | `list_gpu_types` | List all available GPU instance types with pricing, specs, and current availability |
-| `start_instance` | Launch a new GPU instance |
+| `start_instance` | Launch a new GPU instance; optional `image` (an image id or a family, auto-detected) to pick a base image |
 | `stop_instance` | Terminate a running instance |
 | `list_running_instances` | Show all running instances with status and connection details |
 | `check_availability` | Check if a specific GPU type is available |
+| `list_images` | List available base images (IDs and families) for use with `start_instance` |
 
 ## Example Prompts
 

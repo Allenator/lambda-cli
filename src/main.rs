@@ -7,7 +7,7 @@ use crossterm::{
     execute,
     terminal::{Clear, ClearType},
 };
-use lambda_cli::api::{LambdaClient, LambdaError};
+use lambda_cli::api::{group_image_builds, ImageRef, LambdaClient, LambdaError};
 use lambda_cli::notify::{InstanceReadyMessage, Notifier, NotifyConfig};
 use prettytable::{row, Table};
 use std::io::{stdout, Write};
@@ -17,7 +17,7 @@ use tokio::runtime::Runtime;
 /// A command-line tool for Lambda cloud GPU API
 #[derive(Parser)]
 #[command(name = "lambda")]
-#[command(version = "0.2.0")]
+#[command(version)]
 #[command(about = "A command-line tool for Lambda cloud GPU API", long_about = None)]
 struct Cli {
     #[command(subcommand)]
@@ -42,6 +42,15 @@ enum Commands {
         /// Region to launch in (auto-selects first available if not specified)
         #[arg(short, long)]
         region: Option<String>,
+        /// Base image: an image id or a family, auto-detected (see `lambda images`)
+        #[arg(long)]
+        image: Option<String>,
+        /// Base image id to launch (exact image; see `lambda images`)
+        #[arg(long, conflicts_with = "image")]
+        image_id: Option<String>,
+        /// Base image family to launch (newest image in the family)
+        #[arg(long, conflicts_with_all = ["image", "image_id"])]
+        image_family: Option<String>,
         /// Filesystem name to attach (must be in same region)
         #[arg(short, long)]
         filesystem: Option<String>,
@@ -71,12 +80,28 @@ enum Commands {
         /// Optional name for the instance when launched
         #[arg(short, long)]
         name: Option<String>,
+        /// Base image: an image id or a family, auto-detected (see `lambda images`)
+        #[arg(long)]
+        image: Option<String>,
+        /// Base image id to launch (exact image; see `lambda images`)
+        #[arg(long, conflicts_with = "image")]
+        image_id: Option<String>,
+        /// Base image family to launch (newest image in the family)
+        #[arg(long, conflicts_with_all = ["image", "image_id"])]
+        image_family: Option<String>,
         /// Filesystem name to attach when launched (must be in same region)
         #[arg(short, long)]
         filesystem: Option<String>,
         /// Disable notifications even if LAMBDA_NOTIFY_* env vars are set
         #[arg(long)]
         no_notify: bool,
+    },
+    /// List all available base images
+    Images {
+        /// Show every image object (one row per id and region) instead of the
+        /// deduplicated per-build view
+        #[arg(long)]
+        all: bool,
     },
     /// List all filesystems (persistent storage)
     Filesystems,
@@ -118,18 +143,29 @@ fn run() -> Result<()> {
             ssh,
             name,
             region,
+            image,
+            image_id,
+            image_family,
             filesystem,
             no_notify,
-        }) => start_instance(
-            &rt,
-            &client,
-            gpu,
-            ssh,
-            name.as_deref(),
-            region.as_deref(),
-            filesystem.as_deref(),
-            *no_notify,
-        ),
+        }) => {
+            let image_ref = cli_image_ref(
+                image.as_deref(),
+                image_id.as_deref(),
+                image_family.as_deref(),
+            );
+            start_instance(
+                &rt,
+                &client,
+                gpu,
+                ssh,
+                name.as_deref(),
+                region.as_deref(),
+                image_ref,
+                filesystem.as_deref(),
+                *no_notify,
+            )
+        }
         Some(Commands::Stop { instance_id }) => stop_instance(&rt, &client, instance_id),
         Some(Commands::Running) => list_running_instances(&rt, &client),
         Some(Commands::Find {
@@ -137,18 +173,30 @@ fn run() -> Result<()> {
             ssh,
             interval,
             name,
+            image,
+            image_id,
+            image_family,
             filesystem,
             no_notify,
-        }) => find_and_start_instance(
-            &rt,
-            &client,
-            gpu,
-            ssh,
-            *interval,
-            name.as_deref(),
-            filesystem.as_deref(),
-            *no_notify,
-        ),
+        }) => {
+            let image_ref = cli_image_ref(
+                image.as_deref(),
+                image_id.as_deref(),
+                image_family.as_deref(),
+            );
+            find_and_start_instance(
+                &rt,
+                &client,
+                gpu,
+                ssh,
+                *interval,
+                name.as_deref(),
+                image_ref,
+                filesystem.as_deref(),
+                *no_notify,
+            )
+        }
+        Some(Commands::Images { all }) => list_images(&rt, &client, *all),
         Some(Commands::Filesystems) => list_filesystems(&rt, &client),
         Some(Commands::CreateFilesystem { name, region }) => {
             create_filesystem(&rt, &client, name, region)
@@ -208,6 +256,104 @@ fn list_instances(rt: &Runtime, client: &LambdaClient) -> Result<()> {
     Ok(())
 }
 
+/// Resolve the `--image` / `--image-id` / `--image-family` flags into an `ImageRef`.
+/// clap enforces that at most one is set, so this just routes: `--image` is
+/// auto-detected (id vs family), the explicit flags force their kind.
+fn cli_image_ref<'a>(
+    image: Option<&'a str>,
+    image_id: Option<&'a str>,
+    image_family: Option<&'a str>,
+) -> Option<ImageRef<'a>> {
+    if let Some(value) = image {
+        Some(ImageRef::smart(value))
+    } else if let Some(id) = image_id {
+        Some(ImageRef::Id(id))
+    } else {
+        image_family.map(ImageRef::Family)
+    }
+}
+
+/// Region set for a pinned image id, used by `find` to decide when to launch.
+/// `None` means "no region constraint": either no id is pinned (a family/none is
+/// region-agnostic), or the id is valid but the API returned no region info. Errors
+/// only if the id matches no image. Matching is canonical (any hyphenation/case).
+fn pinned_image_regions(
+    rt: &Runtime,
+    client: &LambdaClient,
+    image: Option<ImageRef<'_>>,
+) -> Result<Option<Vec<String>>> {
+    let Some(ImageRef::Id(id)) = image else {
+        return Ok(None);
+    };
+    let (_canonical, regions) = rt.block_on(client.resolve_image_id(id))?;
+    Ok((!regions.is_empty()).then_some(regions))
+}
+
+fn list_images(rt: &Runtime, client: &LambdaClient, all: bool) -> Result<()> {
+    let images = rt.block_on(client.list_images())?;
+
+    if images.is_empty() {
+        println!("{}", "No images".yellow());
+        return Ok(());
+    }
+
+    let mut table = Table::new();
+
+    if all {
+        // Full per-object view: one row per image id and region. Family/ID lead,
+        // since those are the values `--image` accepts (a `name` is not a launch key).
+        table.add_row(row!["Family", "ID", "Name", "Version", "Arch", "Region"]);
+        for img in images {
+            let region = img
+                .region
+                .and_then(|r| r.name)
+                .unwrap_or_else(|| "-".to_string());
+            table.add_row(row![
+                img.family.as_deref().unwrap_or("-").blue(),
+                img.id.cyan(),
+                img.name.as_deref().unwrap_or("-").green(),
+                img.version.as_deref().unwrap_or("-"),
+                img.architecture.as_deref().unwrap_or("-"),
+                region
+            ]);
+        }
+    } else {
+        // Grouped view (shared with the MCP list_images tool): one row per
+        // (family, arch) showing the newest build `--image-family` would launch and
+        // every region it's offered in. Per-version/per-id detail lives in `--all`.
+        table.add_row(row!["Family", "Latest Version", "Arch", "Regions"]);
+        for build in group_image_builds(images) {
+            // `regions_summary` lists a few regions inline, else a count (--all for
+            // the full per-region breakdown); shared with the MCP grouped view.
+            let regions = build.regions_summary();
+            table.add_row(row![
+                build.family.blue(),
+                build.latest_version,
+                build.arch,
+                regions.dimmed()
+            ]);
+        }
+    }
+
+    table.printstd();
+    if all {
+        println!(
+            "\nLaunch with {} using a {} (recommended, region-agnostic) or {}.",
+            "--image".cyan(),
+            "Family".blue(),
+            "ID".cyan()
+        );
+    } else {
+        println!(
+            "\nLaunch with {} using a {} (recommended). Run {} for individual image ids per region.",
+            "--image".cyan(),
+            "Family".blue(),
+            "lambda images --all".cyan()
+        );
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn start_instance(
     rt: &Runtime,
@@ -216,6 +362,7 @@ fn start_instance(
     ssh: &str,
     name: Option<&str>,
     region: Option<&str>,
+    image: Option<ImageRef<'_>>,
     filesystem: Option<&str>,
     no_notify: bool,
 ) -> Result<()> {
@@ -236,20 +383,23 @@ fn start_instance(
     let fs_info = filesystem
         .map(|f| format!(" with filesystem '{}'", f.magenta()))
         .unwrap_or_default();
-    println!(
-        "Launching {} {}{}...",
-        gpu.green(),
-        name.map(|n| format!("as '{}'", n.cyan()))
-            .unwrap_or_default(),
-        fs_info
-    );
+    let name_info = name
+        .map(|n| format!(" as '{}'", n.cyan()))
+        .unwrap_or_default();
 
-    let result =
-        rt.block_on(client.launch_instance_with_filesystem(gpu, ssh, name, region, filesystem))?;
+    // Image validation and region selection happen inside the launch call, which
+    // can reject (bad id/family, or the image not offered in an available region)
+    // before anything is created — so we announce a launch only once it succeeds.
+    let result = rt.block_on(
+        client.launch_instance_with_filesystem(gpu, ssh, name, region, image, filesystem),
+    )?;
 
     println!(
-        "{} Instance {} launched in region {}",
+        "{} Launched {}{}{} - instance {} in region {}",
         "Success!".green().bold(),
+        gpu.green(),
+        name_info,
+        fs_info,
         result.instance_id.cyan(),
         result.region.blue()
     );
@@ -406,6 +556,7 @@ fn find_and_start_instance(
     ssh: &str,
     interval: u64,
     name: Option<&str>,
+    image: Option<ImageRef<'_>>,
     filesystem: Option<&str>,
     no_notify: bool,
 ) -> Result<()> {
@@ -413,11 +564,20 @@ fn find_and_start_instance(
         return Err(LambdaError::SshKeyRequired.into());
     }
 
+    // Validate a pinned image id up front (fail fast) and show where it's offered.
+    let img_regions = pinned_image_regions(rt, client, image)?;
+
     println!(
         "Looking for available {} instances (polling every {}s)...",
         gpu.green(),
         interval
     );
+    if let Some(ref regs) = img_regions {
+        println!(
+            "Pinned image is available in {}; waiting for capacity there.",
+            regs.join(", ").blue()
+        );
+    }
     println!("Press Ctrl+C to stop\n");
 
     let mut first_check = true;
@@ -432,6 +592,30 @@ fn find_and_start_instance(
 
         match rt.block_on(client.check_availability(gpu)) {
             Ok(regions) if !regions.is_empty() => {
+                // Re-resolve the pinned image's regions fresh (they can change over
+                // a long poll) and only launch when capacity overlaps; a family/none
+                // is region-agnostic. The launch call itself picks the exact region.
+                let fresh = match pinned_image_regions(rt, client, image) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("{} {}", "Warning:".yellow(), e);
+                        continue;
+                    }
+                };
+                if let Some(ref ir) = fresh {
+                    if !regions.iter().any(|r| ir.contains(r)) {
+                        execute!(stdout(), Clear(ClearType::All), MoveTo(0, 0)).ok();
+                        println!(
+                            "{} {} is available in {}, but the pinned image isn't offered in those regions yet.",
+                            "Info:".blue(),
+                            gpu.green(),
+                            regions.join(", ").blue()
+                        );
+                        println!("Next check in {} seconds... (Ctrl+C to stop)", interval);
+                        continue;
+                    }
+                }
+
                 execute!(stdout(), Clear(ClearType::All), MoveTo(0, 0)).ok();
                 println!(
                     "{} Found {} available in: {}",
@@ -440,7 +624,9 @@ fn find_and_start_instance(
                     regions.join(", ").blue()
                 );
 
-                return start_instance(rt, client, gpu, ssh, name, None, filesystem, no_notify);
+                return start_instance(
+                    rt, client, gpu, ssh, name, None, image, filesystem, no_notify,
+                );
             }
             Ok(_) => {
                 // No availability

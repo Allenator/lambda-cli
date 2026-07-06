@@ -135,6 +135,143 @@ enum ApiKeySource {
     Command(String),
 }
 
+/// Reference to a base image for launch. The Lambda API `image` object accepts
+/// exactly one of `id` (a specific image) or `family` (newest in the family).
+#[derive(Debug, Clone, Copy)]
+pub enum ImageRef<'a> {
+    Id(&'a str),
+    Family(&'a str),
+}
+
+impl<'a> ImageRef<'a> {
+    /// Classify a raw value as an image id or a family and build the matching
+    /// `ImageRef`. Image ids are UUIDs and families are human-readable slugs
+    /// (e.g. `lambda-stack-24-04`), so the two never collide — this backs the
+    /// forgiving `--image` CLI flag and the MCP `image` param.
+    pub fn smart(value: &'a str) -> Self {
+        if looks_like_image_id(value) {
+            ImageRef::Id(value)
+        } else {
+            ImageRef::Family(value)
+        }
+    }
+}
+
+/// A Lambda image id is a UUID (32 hex digits, optionally hyphenated); families
+/// are human slugs that always contain non-hex letters, so "exactly 32 hex digits
+/// once hyphens are removed" cleanly tells an id from a family.
+fn looks_like_image_id(value: &str) -> bool {
+    let mut hex_digits = 0usize;
+    for c in value.chars() {
+        match c {
+            '-' => {}
+            c if c.is_ascii_hexdigit() => hex_digits += 1,
+            _ => return false,
+        }
+    }
+    hex_digits == 32
+}
+
+/// Canonical form of an image id for comparison: hyphens removed, lowercased. Lets
+/// a user pass a UUID in any hyphenation/case and still match the `/images` form.
+fn canonical_id(id: &str) -> String {
+    id.chars()
+        .filter(|c| *c != '-')
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
+/// Numeric components of a version, for ordering (so `24.4.10` sorts after `24.4.9`).
+pub fn version_key(version: &str) -> Vec<u64> {
+    version
+        .split(|c: char| !c.is_ascii_digit())
+        .filter_map(|s| s.parse::<u64>().ok())
+        .collect()
+}
+
+/// A base image returned by `GET /images`. Every field except `id` is optional so
+/// a null or omitted value in the response doesn't fail the whole list. `region`
+/// reuses `RegionInfo` (name-only, lenient), ignoring the region's `description`.
+#[derive(Deserialize, Debug, Clone, Serialize)]
+pub struct Image {
+    pub id: String,
+    pub name: Option<String>,
+    pub family: Option<String>,
+    pub version: Option<String>,
+    pub architecture: Option<String>,
+    pub description: Option<String>,
+    pub region: Option<RegionInfo>,
+}
+
+/// `/images` collapsed to one entry per (family, architecture): the newest version
+/// in that group and every region it is offered in. Shared by the `lambda images`
+/// default view and the MCP `list_images` tool so their granularity stays in sync.
+#[derive(Debug, Clone)]
+pub struct ImageBuild {
+    pub family: String,
+    pub arch: String,
+    pub latest_version: String,
+    pub regions: Vec<String>,
+}
+
+impl ImageBuild {
+    /// How many regions to list inline before collapsing to a count.
+    const REGION_LIST_MAX: usize = 4;
+
+    /// Human-readable region summary shared by the CLI and MCP grouped views: the
+    /// full list when there are a few, a count otherwise, `-` when none.
+    pub fn regions_summary(&self) -> String {
+        match self.regions.len() {
+            0 => "-".to_string(),
+            n if n <= Self::REGION_LIST_MAX => self.regions.join(", "),
+            n => format!("{n} regions"),
+        }
+    }
+}
+
+/// Group raw `/images` objects (one per id and region) into one `ImageBuild` per
+/// (family, arch), keeping the newest version and the sorted, de-duplicated region
+/// set. Consumes `images` to avoid copies. Ordered by (family, arch).
+pub fn group_image_builds(images: Vec<Image>) -> Vec<ImageBuild> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    #[derive(Default)]
+    struct Acc {
+        latest_version: String,
+        regions: BTreeSet<String>,
+    }
+
+    let mut builds: BTreeMap<(String, String), Acc> = BTreeMap::new();
+    for img in images {
+        let family = img.family.unwrap_or_else(|| "-".to_string());
+        let arch = img.architecture.unwrap_or_else(|| "-".to_string());
+        // Treat a null OR empty version as the "-" placeholder so the is_empty()
+        // sentinel below only ever fires on the accumulator's initial state.
+        let version = img
+            .version
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "-".to_string());
+        let acc = builds.entry((family, arch)).or_default();
+        if acc.latest_version.is_empty() || version_key(&version) > version_key(&acc.latest_version)
+        {
+            acc.latest_version = version;
+        }
+        if let Some(name) = img.region.and_then(|r| r.name) {
+            acc.regions.insert(name);
+        }
+    }
+
+    builds
+        .into_iter()
+        .map(|((family, arch), acc)| ImageBuild {
+            family,
+            arch,
+            latest_version: acc.latest_version,
+            regions: acc.regions.into_iter().collect(),
+        })
+        .collect()
+}
+
 /// Lambda API client
 pub struct LambdaClient {
     client: Client,
@@ -336,7 +473,7 @@ impl LambdaClient {
         name: Option<&str>,
         region: Option<&str>,
     ) -> Result<LaunchResult> {
-        self.launch_instance_with_filesystem(gpu, ssh_key, name, region, None)
+        self.launch_instance_with_filesystem(gpu, ssh_key, name, region, None, None)
             .await
     }
 
@@ -347,6 +484,7 @@ impl LambdaClient {
         ssh_key: &str,
         name: Option<&str>,
         region: Option<&str>,
+        image: Option<ImageRef<'_>>,
         filesystem: Option<&str>,
     ) -> Result<LaunchResult> {
         let instance_type_response = self
@@ -354,34 +492,69 @@ impl LambdaClient {
             .await?
             .ok_or_else(|| LambdaError::InstanceTypeNotFound(gpu.to_string()))?;
 
-        let region_name = if let Some(r) = region {
-            // Validate the specified region is available
-            if !instance_type_response
-                .regions_with_capacity_available
-                .iter()
-                .any(|reg| reg.name == r)
-            {
-                return Err(anyhow!(
-                    "Region '{}' is not available for instance type '{}'. Available regions: {}",
-                    r,
-                    gpu,
-                    instance_type_response
-                        .regions_with_capacity_available
-                        .iter()
-                        .map(|reg| reg.name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
+        let capacity: Vec<String> = instance_type_response
+            .regions_with_capacity_available
+            .iter()
+            .map(|r| r.name.clone())
+            .collect();
+
+        // Resolve the requested image once (single GET /images). A pinned id is
+        // validated + canonicalized (users may pass any hyphenation/case) and
+        // constrains region selection to where it exists; a family is validated but
+        // region-agnostic. This lives here so every caller (CLI and MCP) behaves
+        // the same.
+        let (image_value, image_regions): (Option<serde_json::Value>, Option<Vec<String>>) =
+            match image {
+                Some(ImageRef::Id(id)) => {
+                    let (canonical, regions) = self.resolve_image_id(id).await?;
+                    let regions = (!regions.is_empty()).then_some(regions);
+                    (Some(serde_json::json!({ "id": canonical })), regions)
+                }
+                Some(ImageRef::Family(family)) => {
+                    self.validate_image_family(family).await?;
+                    (Some(serde_json::json!({ "family": family })), None)
+                }
+                None => (None, None),
+            };
+
+        let region_name = match region {
+            Some(r) => {
+                if !capacity.iter().any(|c| c.as_str() == r) {
+                    return Err(anyhow!(
+                        "Region '{}' is not available for instance type '{}'. Available regions: {}",
+                        r,
+                        gpu,
+                        capacity.join(", ")
+                    ));
+                }
+                if let Some(ref regions) = image_regions {
+                    if !regions.iter().any(|ir| ir.as_str() == r) {
+                        return Err(anyhow!(
+                            "Region '{}' does not offer the requested image (available in: {})",
+                            r,
+                            regions.join(", ")
+                        ));
+                    }
+                }
+                r.to_string()
             }
-            r.to_string()
-        } else {
-            // Auto-select first available region
-            instance_type_response
-                .regions_with_capacity_available
-                .first()
-                .ok_or_else(|| LambdaError::NoRegionsAvailable(gpu.to_string()))?
-                .name
-                .clone()
+            None => match &image_regions {
+                Some(regions) => capacity
+                    .iter()
+                    .find(|c| regions.contains(*c))
+                    .cloned()
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "The requested image is available in [{}], but none of those regions currently have {} capacity.",
+                            regions.join(", "),
+                            gpu
+                        )
+                    })?,
+                None => capacity
+                    .first()
+                    .cloned()
+                    .ok_or_else(|| LambdaError::NoRegionsAvailable(gpu.to_string()))?,
+            },
         };
 
         let url = format!("{}/instance-operations/launch", API_BASE_URL);
@@ -395,6 +568,10 @@ impl LambdaClient {
 
         if let Some(instance_name) = name {
             payload["name"] = serde_json::Value::String(instance_name.to_string());
+        }
+
+        if let Some(image_value) = image_value {
+            payload["image"] = image_value;
         }
 
         if let Some(fs_name) = filesystem {
@@ -526,6 +703,78 @@ impl LambdaClient {
             .into_iter()
             .map(|r| r.name)
             .collect())
+    }
+
+    /// Resolve a pinned image id (accepted in any hyphenation/case) to its canonical
+    /// id and the set of regions it is offered in. The region set may be empty if the
+    /// API omitted region info for a valid id; only a total absence of the id is an
+    /// error. Shared by `launch_instance_with_filesystem` and the `find` command.
+    pub async fn resolve_image_id(&self, id: &str) -> Result<(String, Vec<String>)> {
+        let images = self.list_images().await?;
+        let target = canonical_id(id);
+        let matches: Vec<&Image> = images
+            .iter()
+            .filter(|i| canonical_id(&i.id) == target)
+            .collect();
+        let canonical = matches
+            .first()
+            .ok_or_else(|| {
+                anyhow!(
+                    "Image id '{}' not found. Run `lambda images` to see valid ids.",
+                    id
+                )
+            })?
+            .id
+            .clone();
+        let mut regions: Vec<String> = matches
+            .iter()
+            .filter_map(|i| i.region.as_ref().and_then(|r| r.name.clone()))
+            .collect();
+        regions.sort();
+        regions.dedup();
+        Ok((canonical, regions))
+    }
+
+    /// Validate that an image family exists, erroring with the available families.
+    async fn validate_image_family(&self, family: &str) -> Result<()> {
+        let images = self.list_images().await?;
+        let mut families: Vec<&str> = images.iter().filter_map(|i| i.family.as_deref()).collect();
+        families.sort();
+        families.dedup();
+        if families.contains(&family) {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "Image family '{}' not found. Available families: {}",
+                family,
+                families.join(", ")
+            ))
+        }
+    }
+
+    /// List all available base images (GET /images)
+    pub async fn list_images(&self) -> Result<Vec<Image>> {
+        let api_key = self.get_api_key()?;
+        let url = format!("{}/images", API_BASE_URL);
+        let response = self
+            .client
+            .get(&url)
+            .header(AUTHORIZATION, format!("Bearer {}", api_key))
+            .send()
+            .await
+            .context("Failed to fetch images")?;
+
+        if !response.status().is_success() {
+            let error_msg = Self::parse_error_response(response).await;
+            return Err(anyhow!("Failed to list images: {}", error_msg));
+        }
+
+        let response: ApiResponse<Vec<Image>> = response
+            .json()
+            .await
+            .context("Failed to parse images response")?;
+
+        Ok(response.data)
     }
 
     /// List all filesystems
@@ -677,5 +926,82 @@ mod tests {
     #[test]
     fn test_api_base_url() {
         assert_eq!(API_BASE_URL, "https://cloud.lambdalabs.com/api/v1");
+    }
+
+    #[test]
+    fn test_image_ref_smart_detects_id_vs_family() {
+        // Real ids are UUIDs (hyphenated) or bare 32-hex; families are slugs.
+        for id in [
+            "f9ba07bd-c60b-4e08-ab29-5d9be6bd62d0",
+            "f525e0fb0d234f37b765c6aa55bc459a",
+        ] {
+            assert!(
+                matches!(ImageRef::smart(id), ImageRef::Id(_)),
+                "{id} should be an id"
+            );
+        }
+        for family in [
+            "lambda-stack-24-04",
+            "gpu-base-22-04",
+            "ubuntu-24-04",
+            "lambda-stack-legacy-22-04",
+        ] {
+            assert!(
+                matches!(ImageRef::smart(family), ImageRef::Family(_)),
+                "{family} should be a family"
+            );
+        }
+    }
+
+    #[test]
+    fn test_version_key_orders_numerically() {
+        // Purely numeric ordering, so 24.4.10 is newer than 24.4.9 (lexical sort
+        // would get this wrong) and build suffixes are compared as numbers.
+        assert!(version_key("24.4.10-2141") > version_key("24.4.9-9999"));
+        assert!(version_key("24.4.4-2141") > version_key("24.4.3-1722"));
+        assert!(version_key("22.4.5-20250702") > version_key("22.4.5-20250626"));
+        // Non-numeric / empty inputs are handled without panicking.
+        assert_eq!(version_key("-"), Vec::<u64>::new());
+        assert!(version_key("1.0") > version_key("-"));
+    }
+
+    #[test]
+    fn test_group_image_builds_dedups_by_family_arch() {
+        let img = |id: &str, family: Option<&str>, version: &str, arch: &str, region: &str| Image {
+            id: id.to_string(),
+            name: None,
+            family: family.map(String::from),
+            version: Some(version.to_string()),
+            architecture: Some(arch.to_string()),
+            description: None,
+            region: Some(RegionInfo {
+                name: Some(region.to_string()),
+            }),
+        };
+        let images = vec![
+            // Regions deliberately out of order and duplicated across the two x86_64
+            // rows; the newest version is the 3rd row, not the last inserted.
+            img("a", Some("ls-24"), "24.4.4-2141", "x86_64", "us-west-1"),
+            img("b", Some("ls-24"), "24.4.3-1722", "x86_64", "us-east-1"),
+            img("c", Some("ls-24"), "24.4.4-2141", "x86_64", "us-west-1"),
+            img("d", Some("ls-24"), "24.4.4-2141", "arm64", "us-east-3"),
+            // A null-family image buckets under "-" and must not merge with ls-24.
+            img("e", None, "1.0", "x86_64", "eu-west-1"),
+        ];
+        let builds = group_image_builds(images);
+        // (ls-24, x86_64), (ls-24, arm64), ("-", x86_64) => three builds.
+        assert_eq!(builds.len(), 3);
+
+        let x86 = builds
+            .iter()
+            .find(|b| b.family == "ls-24" && b.arch == "x86_64")
+            .unwrap();
+        assert_eq!(x86.latest_version, "24.4.4-2141");
+        // Sorted and de-duplicated despite out-of-order, duplicated inputs.
+        assert_eq!(x86.regions, vec!["us-east-1", "us-west-1"]);
+        assert_eq!(x86.regions_summary(), "us-east-1, us-west-1");
+
+        // Null-family image is bucketed under "-", not merged into ls-24.
+        assert!(builds.iter().any(|b| b.family == "-"));
     }
 }
